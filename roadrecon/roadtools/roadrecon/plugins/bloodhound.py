@@ -27,7 +27,7 @@ import os
 import json
 import argparse
 import sys
-from roadtools.roadlib.metadef.database import ServicePrincipal, User, Group, DirectoryRole
+from roadtools.roadlib.metadef.database import ServicePrincipal, User, Group, DirectoryRole, lnk_group_member_user
 import roadtools.roadlib.metadef.database as database
 try:
     from neo4j import GraphDatabase
@@ -49,10 +49,46 @@ https://github.com/dirkjanm/BloodHound-AzureAD
 
 BASE_LINK_QUERY = 'UNWIND $props AS prop MERGE (n:{0} {{objectid: prop.source}}) MERGE (m:{1} {{objectid: prop.target}}) MERGE (n)-[r:{2}]->(m)';
 
+def from_rel2edge(tx, atype, btype, linktype, db_iter, parent_id):
+    #for r in db_iter:
+    #    add_edge(tx, r.objectId, atype, parent_id, btype, linktype)
+    col = []
+    for r in db_iter:
+        col.append({'source':r.objectId,  'target':parent_id})
+        if len(col)>500:
+            bulk_add_edges(tx, atype, btype, linktype, col)
+            col = []
+    if len(col)>0:
+        bulk_add_edges(tx, atype, btype, linktype, col)
+
+def bulk_add_edges(tx, atype, btype, linktype, props):
+    q = BASE_LINK_QUERY.format(atype, btype, linktype)
+    tx.run(q, props=props)
+
 def add_edge(tx, aid, atype, bid, btype, linktype):
     q = BASE_LINK_QUERY.format(atype, btype, linktype)
     props = {'source':aid, 'target':bid}
     tx.run(q, props=props)
+
+def _yield_limit(qry, pk_attr, maxrq=250):
+    """specialized windowed query generator (using LIMIT/OFFSET)
+
+    This recipe is to select through a large number of rows thats too
+    large to fetch at once. The technique depends on the primary key
+    of the FROM clause being an integer value, and selects items
+    using LIMIT."""
+
+    firstid = None
+    while True:
+        q = qry
+        if firstid is not None:
+            q = qry.filter(pk_attr > firstid)
+        rec = None
+        for rec in q.order_by(pk_attr).limit(maxrq):
+            yield rec
+        if rec is None:
+            break
+        firstid = pk_attr.__get__(rec, pk_attr) if rec else None
 
 class BloodHoundPlugin():
     """
@@ -146,7 +182,9 @@ class BloodHoundPlugin():
             except ClientError as e:
                 pass  # on neo4j 4, an error is raised when the constraint exists already
 
-            for user in self.session.query(User):
+            all_done = self.session.query(User.objectId).count()
+            done = 0
+            for user in _yield_limit(self.session.query(User), User.objectId):
                 property_query = 'UNWIND $props AS prop MERGE (n:AzureUser {objectid: prop.sourceid}) SET n += prop.map'
                 uprops = {
                     'name': user.userPrincipalName,
@@ -160,10 +198,14 @@ class BloodHoundPlugin():
                     # uprops['onPremisesSecurityIdentifier'] = user.onPremisesSecurityIdentifier
                     props['onpremid'] = user.onPremisesSecurityIdentifier
                     property_query = 'UNWIND $props AS prop MERGE (n:AzureUser {objectid: prop.sourceid}) MERGE (m:User {objectid:prop.onpremid}) MERGE (m)-[r:SyncsTo {isacl:false}]->(n) SET n += prop.map'
-
                 res = neosession.run(property_query, props=props)
+                p = (done*100)/all_done
+                print(f"User {p:.3f}%                  \r", flush=True, end='')
+                done += 1
 
-            for sprinc in self.session.query(ServicePrincipal):
+            all_done = self.session.query(ServicePrincipal.objectId).count()
+            done = 0
+            for sprinc in _yield_limit(self.session.query(ServicePrincipal),ServicePrincipal.objectId):
                 property_query = 'UNWIND $props AS prop MERGE (n:ServicePrincipal {objectid: prop.sourceid}) SET n += prop.map'
                 uprops = {
                     'name': sprinc.displayName,
@@ -174,13 +216,15 @@ class BloodHoundPlugin():
                 }
                 props = {'map': uprops, 'sourceid': sprinc.objectId}
                 res = neosession.run(property_query, props=props)
-                for owneruser in sprinc.ownerUsers:
-                    add_edge(neosession, owneruser.objectId, 'AzureUser', sprinc.objectId, 'ServicePrincipal', 'Owns')
-                for ownersp in sprinc.ownerServicePrincipals:
-                    add_edge(neosession, ownersp.objectId, 'ServicePrincipal', sprinc.objectId, 'ServicePrincipal', 'Owns')
+                from_rel2edge(neosession, 'AzureUser', 'ServicePrincipal', 'Owns', sprinc.ownerUsers, sprinc.objectId)
+                from_rel2edge(neosession, 'ServicePrincipal', 'ServicePrincipal', 'Owns', sprinc.ownerServicePrincipals, sprinc.objectId)
+                p = (done*100)/all_done
+                print(f"ServicePrincipal {p:.3f}%     \r", flush=True, end='')
+                done += 1
 
-
-            for group in self.session.query(Group):
+            all_done = self.session.query(Group.objectId).count()
+            done = 0
+            for group in _yield_limit(self.session.query(Group), Group.objectId):
                 property_query = 'UNWIND $props AS prop MERGE (n:AzureGroup {objectid: prop.sourceid}) SET n += prop.map'
                 uprops = {
                     'name': group.displayName,
@@ -194,15 +238,18 @@ class BloodHoundPlugin():
                     property_query = 'UNWIND $props AS prop MERGE (n:AzureGroup {objectid: prop.sourceid}) MERGE (m:Group {objectid:prop.onpremid}) MERGE (m)-[r:SyncsTo {isacl:false}]->(n) SET n += prop.map'
 
                 res = neosession.run(property_query, props=props)
-                for memberuser in group.memberUsers:
-                    add_edge(neosession, memberuser.objectId, 'AzureUser', group.objectId, 'AzureGroup', 'MemberOf')
-                for membergroup in group.memberGroups:
-                    add_edge(neosession, membergroup.objectId, 'AzureGroup', group.objectId, 'AzureGroup', 'MemberOf')
-                for membersp in group.memberServicePrincipals:
-                    add_edge(neosession, membersp.objectId, 'AzureGroup', group.objectId, 'ServicePrincipal', 'MemberOf')
+                #group.memberUsers can be huge!
+                from_rel2edge(neosession, 'AzureUser', 'AzureGroup', 'MemberOf', _yield_limit(group.memberUsers, User.objectId), group.objectId)
+                from_rel2edge(neosession, 'AzureGroup', 'AzureGroup', 'MemberOf', group.memberGroups, group.objectId)
+                from_rel2edge(neosession, 'AzureGroup', 'ServicePrincipal', 'MemberOf', group.memberServicePrincipals, group.objectId)
+                p = (done*100)/all_done
+                print(f"Group {p:.3f}%               \r", flush=True, end='')
+                done += 1
 
 
-            for role in self.session.query(DirectoryRole):
+            all_done = self.session.query(DirectoryRole.objectId).count()
+            done = 0
+            for role in _yield_limit(self.session.query(DirectoryRole), DirectoryRole.objectId):
                 property_query = 'UNWIND $props AS prop MERGE (n:AzureRole {objectid: prop.sourceid}) SET n += prop.map'
                 uprops = {
                     'name': role.displayName,
@@ -212,13 +259,14 @@ class BloodHoundPlugin():
                 }
                 props = {'map': uprops, 'sourceid': role.objectId}
                 res = neosession.run(property_query, props=props)
-                for memberuser in role.memberUsers:
-                    add_edge(neosession, memberuser.objectId, 'AzureUser', role.objectId, 'AzureRole', 'MemberOf')
 
-                for memberuser in role.memberServicePrincipals:
-                    add_edge(neosession, memberuser.objectId, 'ServicePrincipal', role.objectId, 'AzureRole', 'MemberOf')
+                from_rel2edge(neosession, 'AzureUser', 'AzureRole', 'MemberOf', role.memberUsers, role.objectId)
+                from_rel2edge(neosession, 'ServicePrincipal', 'AzureRole', 'MemberOf', role.memberServicePrincipals, role.objectId)
+                p = (done*100)/all_done
+                print(f"DirectoryRole {p:.3f}%      \r", flush=True, end='')
+                done += 1
 
-        print('Done!')
+        print('Done!           ')
         self.driver.close()
 
 def add_args(parser):
